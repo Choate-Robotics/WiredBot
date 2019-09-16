@@ -11,18 +11,10 @@ import textwrap
 import time
 import traceback
 import types
-import string
-import smtplib
-import re
-import ssl
 import discord
 import discord.abc
-import aiohttp
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from credentials import BOT_TOKEN,EMAIL_HOST_PASSWORD,JUPYTER_HUB_API_ENDPOINT,JUPYTER_HUB_API_TOKEN
+from credentials import BOT_TOKEN
 from utils import send_messages, split_message, split_send_message
-from cpu_logo_b64encoded import logo
 
 logger = logging.getLogger('discord')
 logger.setLevel(logging.DEBUG)
@@ -42,16 +34,9 @@ logger.addHandler(handler)
 
 bot = discord.Client()
 
-DEBUG = True
+DEBUG = False
 
-allowed_guild_ids = (479544231875182592, 426702004606337034)
-CPU_guild_id = 479544231875182592 if DEBUG else 426702004606337034
-
-conn = sqlite3.Connection('db.sqlite3')
-cursor = conn.cursor()
-
-attendance_key = secrets.token_hex(32)
-effective_meeting_count = 1
+guild_id = 615943246706901013
 
 
 class InterfaceMeta(type):
@@ -86,19 +71,6 @@ class BaseInterface(metaclass=InterfaceMeta):
     
     async def dispatch(self, command: str, message) -> list:
         if not self._dispatch_locked:
-            if secrets.compare_digest(command, attendance_key):
-                cursor.execute('SELECT * FROM attendance WHERE discord_user_id=? AND time>? AND time<? LIMIT 1', (
-                message.author.id, datetime.datetime.now() - datetime.timedelta(days=1), datetime.datetime.now() + datetime.timedelta(days=1)))
-                if cursor.fetchone():
-                    return await split_send_message(message.author, 'Your attendance for today has already been recorded.')
-                
-                cursor.execute('INSERT INTO attendance VALUES (?,?,?)',
-                               (message.author.id, datetime.datetime.now(),
-                                effective_meeting_count))
-                conn.commit()
-                return await split_send_message(
-                        message.author,
-                        'Thank you. Your attendance has been recorded.')
             try:
                 command = command.split()
                 func = getattr(self, command[0])
@@ -205,202 +177,12 @@ class UserInterface(BaseInterface):
             return msg.channel == channel and not msg.author.bot
         
         return check
-    
-    async def feedback(self, command: list, message: discord.Message) -> tuple:
-        with Conversation(self) as con:
-            feedback_channel = discord.utils.find(
-                    lambda c: c.name == 'feedback', CPU_guild.channels)
-            await con.send(
-                    'Your next message to me will be forwarded to the admin team anonymously. Type `cancel` to cancel.'
-            )
-            try:
-                msg_to_forward = await con.recv()
-            except asyncio.TimeoutError:
-                return 'You have not responded in 30 minutes. I will no longer forward your next message to the admin team.',
-            if msg_to_forward.content == 'cancel':
-                return 'Operation canceled.',
-            try:
-                await feedback_channel.send(msg_to_forward.content)
-            except:
-                await on_error('feedback')
-                return 'Sorry an error has occurred.',
-            return 'Your feedback has been forwarded to the admin team. Thank you.',
-    
-    feedback.usage = 'feedback'
-    feedback.description = 'Send a feedback to the admin team anonymously.'
-    
-    async def opt(self, command: list, message: discord.Message) -> tuple:
-        try:
-            if command[0] == 'out':
-                if command[1] == 'email':
-                    cursor.execute(
-                            "UPDATE oauth_record SET opt_out_email=1 WHERE discord_user_id=?",
-                            (message.author.id,))
-                    conn.commit()
-                    return "You have successfully opted out of our email",
-                elif command[1] == 'dm':
-                    cursor.execute(
-                            "UPDATE oauth_record SET opt_out_pm=1 WHERE discord_user_id=?",
-                            (message.author.id,))
-                    conn.commit()
-                    return "You have successfully opted out of our private message",
-                else:
-                    return self.unrecognized_command(command[1]),
-            elif command[0] == 'in':
-                if command[1] == 'email':
-                    cursor.execute(
-                            "UPDATE oauth_record SET opt_out_email=0 WHERE discord_user_id=?",
-                            (message.author.id,))
-                    conn.commit()
-                    return "You have successfully opted in our email",
-                elif command[1] == 'dm':
-                    cursor.execute(
-                            "UPDATE oauth_record SET opt_out_pm=0 WHERE discord_user_id=?",
-                            (message.author.id,))
-                    conn.commit()
-                    return "You have successfully opted in our direct message",
-                else:
-                    return self.unrecognized_command(command[1]),
-            else:
-                return self.unrecognized_command(command[0]),
-        except IndexError:
-            raise
-        except:
-            await on_error('preference change')
-            return 'An error has occurred',
-    
-    opt.usage = 'opt {in|out} {email|dm}'
-    opt.description = 'Change your preference of whether you want to receive notification by a specific method for announcements.'
-    
-    async def attendance(self, command, message) -> tuple:
-        if command[0] == 'status':
-            cursor.execute(
-                    'SELECT sum(effective), count() FROM attendance where discord_user_id=?',
-                    (message.author.id,))
-            res = cursor.fetchone()  # only one row will be returned
-            if res[1] == 0:
-                return 'You have not attended any meeting this year.',
-            if res[0] == res[1]:
-                return f"You have attended {res[1]} meeting{'s' if res[1] > 1 else ''} this year.",
-            return f"You have attended {res[1]} meeting{'s' if res[1] > 1 else ''} this year, which count{'s' if res[1] == 1 else ''} as {res[0]} meetings with bonuses.",
-        
-        elif command[0] == 'list':
-            cursor.execute(
-                    'SELECT time, effective FROM attendance where discord_user_id=?',
-                    (message.author.id,))
-            res = cursor.fetchall()
-            reply = 'You have attended the following meetings:\n'
-            for att in res:
-                reply += att[0].split()[0]
-                if att[1] != 1:
-                    reply += f' (counts as {att[1]} meetings)'
-                reply += '\n'
-            return split_message(reply)
-        else:
-            return self.unrecognized_command(command[0]),
-    
-    attendance.usage = 'attendance {status|list}'
-    attendance.description = 'Show the number of meetings you have attended'
 
-    async def hub(self,command:list,message:discord.Message):
-        username_to_generate=re.match(r'(?P<n>.+)@choate\.edu',bot.users_cache[message.author.id].school_email).group('n')
-        async with aiohttp.ClientSession() as session:
-            res=await session.post(JUPYTER_HUB_API_ENDPOINT+'/users',
-                                   headers={'Authorization':'token '+JUPYTER_HUB_API_TOKEN},
-                                   json={'usernames':[username_to_generate]}
-                                   )
-            if res.status==201:
-                return [f'Successfully created account with username `{username_to_generate}`. Please log in at https://hub.cpu.party. Your password will be whatever you choose to log in with the first time.']
-            elif res.status==409:
-                return [f'You already have an account. Please log in at https://hub.cpu.party with username `{username_to_generate}`.']
-            else:
-                return ["Error while attempting to create account"]
-            
-            
-            
-            
-    hub.usage='hub'
-    hub.description='Get credentials for your JupyterHub account'
 
 class AdminInterface(UserInterface):
     @property
     def error_reply(self):
         return self.usage
-    
-    async def email(self, command: list, message: discord.Message) -> list:
-        if command[0] == 'list':
-            cursor.execute('SELECT DISTINCT school_email FROM oauth_record WHERE opt_out_email=0')
-            reply = ''
-            for res in cursor.fetchall():
-                reply += res[0] + '\n'
-        elif command[0]=='send':
-            return await send_email(self)
-        else:
-            reply = self.unrecognized_command(command[0])
-        
-        return split_message(reply)
-    
-    email.usage = 'email list'
-    email.description = 'List all unique emails in the database (admin privilege)'
-    
-    async def meeting(self, command: list, message: discord.Message) -> list:
-        global attendance_key, effective_meeting_count
-        if command[0] == 'begin' or command[0] == 'start':
-            attendance_key = secrets.token_hex(3)
-            try:
-                effective_meeting_count = float(command[1])
-            except (IndexError, ValueError):
-                pass
-            
-            reply = 'Attendance key: `%s`. The meeting today counts as %d meeting(s)' % (
-                attendance_key, effective_meeting_count)
-        elif command[0] == 'end' or command[0] == 'stop':
-            attendance_key = secrets.token_hex(64)
-            effective_meeting_count = 1
-            reply = 'Meeting is over. Attendance key revoked.'
-        else:
-            reply = self.unrecognized_command(command[0])
-        return split_message(reply)
-    
-    meeting.usage = 'meeting {begin|start|end|stop} [effective_meeting=1]'
-    meeting.description = 'Starts or stops a club meeting (admin privilege)'
-    
-    async def attendance(self, command, message):
-        if command[0] == 'today':
-            cursor.execute(
-                    "SELECT first_name, last_name FROM attendance a "
-                    "JOIN (SELECT first_name, last_name, discord_user_id FROM oauth_record GROUP BY school_email) o "
-                    "ON o.discord_user_id=a.discord_user_id WHERE a.time>? AND a.time<?; ",
-                    (datetime.date.today() - datetime.timedelta(1),
-                     datetime.date.today() + datetime.timedelta(1)))
-            res = cursor.fetchall()
-            if not res:
-                return "Nobody has attended today's meeting",
-            reply = ''
-            for p in res:
-                reply += p[0] + ' ' + p[1] + '\n'
-            return split_message(reply)
-        if command[0] == 'summary':
-            reply = ''
-            cursor.execute(
-                    "SELECT first_name, last_name, count() as total, sum(a.effective) as effective FROM attendance a "
-                    "JOIN (SELECT first_name, last_name, discord_user_id FROM oauth_record GROUP BY school_email) o "
-                    "ON o.discord_user_id=a.discord_user_id GROUP BY a.discord_user_id ORDER BY effective DESC, total DESC"
-            )
-            res = cursor.fetchall()
-            for first_name, last_name, total, effective in res:
-                reply += '{name:<20} {effective:>4} (actual {total:>2})\n'.format(
-                        name=first_name + ' ' + last_name,
-                        effective=int(effective) if effective % 1 == 0 else round(
-                                effective, 1),
-                        total=total)
-            
-            return split_message(reply, '```')
-        else:
-            return await super().attendance(command, message)
-    
-    attendance.usage = 'attendance {today|summary}'
-    attendance.description = 'Show attendance status (admin privilege)'
     
     async def announcement(self, command, message):
         await make_announcement(self)
@@ -410,275 +192,24 @@ class AdminInterface(UserInterface):
     announcement.description = 'Make announcement (admin privilege)'
 
 
-class ServerAdminInterface(AdminInterface):
-    async def sql(self, command: list, message: discord.Message) -> list:
-        command = list(map(lambda s: s.lower(), command))
-        try:
-            if 'select' not in command or any(
-                    kw in command
-                    for kw in ('update', 'insert', 'drop', 'alter', 'table',
-                               'into', 'create', 'value')):
-                reply = "Only SELECT statement is allowed."
-            else:
-                cursor.execute(' '.join(command))
-                reply = str(' '.join(col[0] for col in cursor.description) +
-                            '\n' + '\n'.join(map(str, (cursor.fetchall()))))
-        except:
-            reply = str(traceback.format_exc())
-        
-        return split_message(reply, enclose_in='```')
-    
-    sql.usage = 'sql $sql_select_query'
-    sql.description = 'Query the database. Currently existing tables are `oauth_record` and `attendance` (server admin privilege)'
-    
-    async def shell(self, command: list, message: discord.Message) -> tuple:
-        if message.author in server_admins:
-            await self.run_shell(command, message.channel)
-            return ()
-        else:
-            return ('Permission denied',)
-    
-    shell.usage = 'shell $*'
-    shell.description = 'Run shell command `$*` in `/srv/CPUBot/` on cpu.party server with root privilege (server admin privilege)'
-    
-    async def restart(self, command: list, message: discord.Message):
-        if message.author in server_admins:
-            await self.run_shell(['service', 'CPUBot', 'restart'],
-                                 message.channel)
-            return ()
-        else:
-            return ('Permission denied',)
-    
-    restart.usage = 'restart'
-    restart.description = 'Restart CPUBot (server admin privilege)'
-    
-    @staticmethod
-    async def run_shell(command: list, channel):
-        timeout = 15
-        if command[0] in ('aria2c', 'curl', 'wget', 'git', 'http'):
-            timeout = 120
-        
-        def kill(proc):
-            if proc.returncode is None:
-                proc.kill()
-                proc.killed_by_bot = True
-        
-        command = ' '.join(command)
-        await channel.send("Executing shell command `%s`" % command)
-        async with channel.typing():
-            PIPE = asyncio.subprocess.PIPE
-            DEVNULL = asyncio.subprocess.DEVNULL
-            proc = await asyncio.subprocess.create_subprocess_shell(
-                    command, stdin=DEVNULL, stderr=PIPE, stdout=PIPE)
-            proc.killed_by_bot = False
-            bot.loop.call_later(timeout, kill, proc)
-            buffer = ''
-            timer = time.time()
-            while proc.returncode is None:
-                if not proc.stdout.at_eof():
-                    buffer += (await proc.stdout.readline()).decode()
-                if not proc.stderr.at_eof():
-                    buffer += (await proc.stderr.readline()).decode()
-                
-                if time.time() - timer > 1 or len(buffer) > 1500:
-                    asyncio.ensure_future(
-                            split_send_message(channel, buffer, '```'))
-                    buffer = ''
-                    timer = time.time()
-                    await asyncio.sleep(0.1)
-            buffer += (await proc.stdout.read()).decode()
-            buffer += (await proc.stderr.read()).decode()
-            if buffer:
-                await split_send_message(channel, buffer, '```')
-            if proc.killed_by_bot:
-                await channel.send(
-                        "Operation exceeded the %d seconds timeout, so I had to kill it:sweat_smile:"
-                        % timeout)
-            await channel.send(
-                    "Process terminated with exit code %d" % proc.returncode)
-
-
 @bot.event
 async def on_ready():
     print('Logged in as %s' % bot.user.name)
-    game = discord.Game("with the source code of life")
+    game = discord.Game("with a wire clipper")
     await bot.change_presence(activity=game)
-    global jerry, server_admins, admins, CPU_guild
+    global jerry, admins, guild
     jerry = bot.get_user(268759214610972673)
-    server_admins = [
-        bot.get_user(387486747770224642),  # Andrew
+    admins = [
+        bot.get_user(191019296229425152),  # Nate
+        bot.get_user(516691587695378445), # Di Tieri
+        bot.get_user(455832935627751444) # Irie
     ]
     
-    server_admins.append(jerry)
+    admins.append(jerry)
     
-    admins = [
-                 bot.get_user(456243117671055371),  # Ethan
-                 bot.get_user(179685458991644673),  # Spencer
-             ] + server_admins
     
-    CPU_guild = discord.utils.find(lambda g: g.id == CPU_guild_id, bot.guilds)
+    guild = discord.utils.find(lambda g: g.id == guild_id, bot.guilds)
 
-
-EMAIL_TEMPLATE = string.Template("""
-Hi $name,
-
-$body
-
-Your beloved,
-CPU Bot
-""")
-EMAIL_HTML_TEMPLATE = string.Template(f"""
-<!DOCType html>
-<html>
-<head>
-    <title>$subject</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        .monospace {{
-            font-family: 'Courier New', monospace;
-        }}
-    </style>
-</head>
-    <body>
-    <img src="https://cpu.party/img/logos/1024w.jpg" width="100%" alt="CPU Logo">
-    <div class="monospace">
-<p>Hi $name,</p>
-
-$body
-
-<p>
-Your beloved,<br>
-CPU Bot
-</p>
-</div>
-    </body>
-</html>
-""")
-
-
-async def send_email(interface: AdminInterface):
-    with Conversation(interface) as con:
-        await con.send("Commencing Email Sending Mode")
-        await con.send("Please enter a subject for the email")
-        subject = (await con.recv()).clean_content
-        await con.send("Please enter the email body. Do not include any greeting or signature.")
-        body = await con.recv()
-        plain_body=body.clean_content
-        async with body.channel.typing():
-            html_body = '<p>' + plain_body
-            html_body = html_body.replace('\n\n', '</p><p>')
-            html_body += '</p>'
-            
-            # Scan for potential urls
-            for link in re.findall(r'https?://(?:www\.)?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*',html_body):
-                link=link
-                if link.endswith('.'):
-                    link=link[:-1]
-                html_body=html_body.replace(link,f'<a href="{link}">{link}</a>')
-        
-            sample_email=MIMEMultipart("alternative")
-            sample_email["Subject"]='(sample) '+subject
-            sample_email["From"]="CPU Bot<bot@cpu.party>"
-            sample_email["To"]=bot.users_cache[body.author.id].school_email
-            sample_email.attach(MIMEText(EMAIL_TEMPLATE.substitute(
-                    {
-                        'name':bot.users_cache[body.author.id].first_name,
-                        'body':plain_body
-                    }),'plain')
-            )
-            sample_email.attach(MIMEText(
-                    EMAIL_HTML_TEMPLATE.safe_substitute({
-                        'body'   : html_body,
-                        'subject': subject,
-                        'name':bot.users_cache[body.author.id].first_name
-                    }),'html'))
-            with smtplib.SMTP("mail.cpu.party") as email_server:
-                email_server.connect('mail.cpu.party',587)
-                email_server.starttls()
-                email_server.ehlo_or_helo_if_needed()
-                email_server.login('bot@cpu.party',EMAIL_HOST_PASSWORD)
-                email_server.ehlo()
-                email_server.send_message(sample_email)
-                
-        await con.send("I have sent you a sample email. It may take up to 5 minutes to arrive. If it looks ok, type `proceed` to send it to everyone. Type `cancel` to cancel")
-            
-        res=await con.recv()
-        if res.clean_content.lower()!='proceed':
-            return ['Operation canceled']
-        else:
-            with smtplib.SMTP("mail.cpu.party") as email_server:
-                email_server.connect('mail.cpu.party',587)
-                email_server.starttls()
-                email_server.ehlo_or_helo_if_needed()
-                email_server.login('bot@cpu.party',EMAIL_HOST_PASSWORD)
-                email_server.ehlo()
-                
-                cursor.execute('SELECT count() FROM oauth_record WHERE opt_out_email=0')
-                total=cursor.fetchone()[0]
-
-                cursor.execute('SELECT first_name, school_email FROM oauth_record WHERE opt_out_email=0')
-                count=0
-                
-                for name, email_addr in cursor.fetchall():
-                    try:
-                        email = MIMEMultipart("alternative")
-                        email["Subject"] = subject
-                        email["From"] = "CPU Bot<bot@cpu.party>"
-                        email["To"] = email_addr
-                        email.attach(MIMEText(EMAIL_TEMPLATE.substitute(
-                                {
-                                    'name': name,
-                                    'body': plain_body
-                                }), 'plain')
-                        )
-                        email.attach(MIMEText(
-                                EMAIL_HTML_TEMPLATE.safe_substitute({
-                                    'body'   : html_body,
-                                    'subject': subject,
-                                    'name'   : name
-                                }), 'html'))
-                        
-                        email_server.send_message(email)
-                        
-                        count+=1
-                        if count%10==0:
-                            await con.send(f'Progress: {count}/{total}')
-                    except:
-                        await on_error('Send email')
-            return [f'A total of {count} emails have been sent']
-            
-            
-            
-
-        
-        
-        
-    
-
-
-@bot.event
-async def on_member_join(member):
-    await member.send('''
-Welcome to CPU. Please adhere to the rules pinned in `#announcements` channel.
-use the `#general` channel of CPU server for general discussions about programming as well as the club;
-use the `#help` channel if you need any help with your programming project or homework;
-the club leaders and are ready to help––specifically, the leaders are proficient in:
-\t- Python (CPython)
-\t- Java
-\t- C++
-\t- HTML (Hypertext Markup Language)
-\t- CSS (Cascade Style Sheets)
-\t- JS (JavaScript, also known as ECMAScript)
-\t- Bash (Bourne again shell);
-use the `#lounge` channel for memes, jokes, chats, flirting, and everything else.
-Please redirect any question about me to my creator Jerry `pkqxdd#1358`.
-So good luck, have fun coding!'''.strip())
-    
-    channel = discord.utils.get(member.guild.channels, name='new-members')
-    try:
-        await channel.send(f"{member.nick} has joined the party. Welcome!")
-    except AttributeError:
-        pass  # Channel does not exist
 
 
 @bot.event
@@ -686,10 +217,7 @@ async def on_message(message):
     if not message.author.bot:
         if isinstance(message.channel, discord.DMChannel):
             if message.author in admins:
-                if message.author in server_admins:
-                    interface = ServerAdminInterface(message.channel)
-                else:
-                    interface = AdminInterface(message.channel)
+                interface = AdminInterface(message.channel)
             else:
                 interface = UserInterface(message.channel)
             try:
@@ -715,7 +243,7 @@ def attach_files(names) -> list:
 async def make_announcement(interface):
     tasks = []
     files = []
-    channel = discord.utils.get(CPU_guild.channels, name='announcements')
+    channel = discord.utils.get(guild.channels, name='announcements')
     
     with Conversation(interface) as con:
         await con.send('Commencing announcement mode.')
@@ -723,44 +251,13 @@ async def make_announcement(interface):
                 'Please send me the announcement you are about to make. Type `cancel` to cancel.'
         )
         
-        message_header = 'Hi $name\n'
+        message_header = 'Hi $name,\n'
         message_body = (await con.recv()).content
         
         if message_body == 'cancel':
             await con.send("Operation cancelled")
             return
         
-        while True:
-            await con.send(
-                    f"Do you wish to attach {'an' if not files else 'another'} image? yes/no"
-            )
-            if (await con.recv()).content.lower() == 'yes':
-                await con.send(
-                        'Please send me the image. Type `cancel` to cancel the image upload.'
-                )
-                res = await con.recv()
-                if res.content == 'cancel':
-                    break
-                if not res.attachments:
-                    await con.send('You did not upload an image. Abort.')
-                    return
-                
-                for attachment in res.attachments:
-                    filename = attachment.filename
-                    binary = io.BytesIO()
-                    await attachment.save(binary)
-                    
-                    h = hashlib.sha1(binary.read()).hexdigest()
-                    binary.seek(0)
-                    
-                    f = open(f"images/{h}.{filename.split('.')[-1]}", 'wb+')
-                    f.write(binary.read())
-                    f.close()
-                    files.append((f"images/{h}.{filename.split('.')[-1]}",
-                                  filename))
-            
-            else:
-                break
         
         await con.send("You are about to make this announcement")
         await con.send('-' * 40)
@@ -776,22 +273,7 @@ async def make_announcement(interface):
         recipients = []
         for member in channel.members:
             if not member.bot:
-                try:
-                    message_header = f"Hi {bot.users_cache[member.id].first_name}"
-                    if bot.users_cache[member.id].opt_out_pm:
-                        continue
-                except KeyError:
-                    update_cache(
-                    )  # some people may have joined after the cache was created
-                    try:
-                        message_header = f"Hi {bot.users_cache[member.id].first_name}"
-                    except KeyError:
-                        message_header = f"Hi {member.name}"
-                
-                if member in admins:
-                    message_header += f", here is an announcement from CPU by {bot.users_cache[interface._channel.recipient.id].first_name}:\n"
-                else:
-                    message_header += ','
+                message_header = f"Hi {member.nick},"
                 recipients.append(member)
                 tasks.append(
                         member.send(
@@ -869,21 +351,6 @@ async def on_error(event_method, *args, **kwargs):
         pass
     finally:
         await discord.Client.on_error(bot, event_method, *args, **kwargs)
-
-
-def update_cache():
-    cursor.execute(
-            'SELECT discord_user_id, first_name, last_name, opt_out_pm, opt_out_email, school_email FROM oauth_record WHERE join_success = 1'
-    )
-    bot.users_cache = {}
-    UserCache = collections.namedtuple(
-            'Cache', ('first_name', 'last_name', 'opt_out_pm', 'opt_out_email',
-                      'school_email'))
-    for record in cursor.fetchall():
-        bot.users_cache[record[0]] = UserCache(*record[1:])
-
-
-update_cache()
 
 if __name__ == '__main__':
     bot.run(BOT_TOKEN)
